@@ -436,8 +436,31 @@ def confidence_to_similarity(conf: np.ndarray, valid: np.ndarray) -> np.ndarray:
     return sim
 
 
-def scaled_intrinsic(K: np.ndarray, k: int) -> np.ndarray:
-    return np.diag([float(k), float(k), 1.0]) @ K
+def scaled_intrinsic(K: np.ndarray, k: int, aligned: bool = False) -> np.ndarray:
+    """Network-resolution K -> K of the k-times larger texture image / depth grid.
+
+    aligned=False (legacy, v1-v3): plain diag(k, k, 1) @ K.
+    aligned=True: also shifts the principal point by (k-1)/2.  Every resize in this
+    pipeline (PIL for the photos, cv2 for the depth maps) is centre-aligned, so network
+    pixel i covers image pixels k*i .. k*i+k-1 and its centre lands on k*i + (k-1)/2, not
+    on k*i.  Without the shift each view's rays -- depth AND colour -- are off by
+    (k-1)/2 image pixels (1 px at k=3, ~0.13 mm on the face) in that view's own image
+    axes, so different views disagree with each other by up to that much.
+    """
+    Ks = np.diag([float(k), float(k), 1.0]) @ K
+    if aligned:
+        Ks[0, 2] += 0.5 * (k - 1)
+        Ks[1, 2] += 0.5 * (k - 1)
+    return Ks
+
+
+def unscaled_intrinsic(K_img: np.ndarray, k: int, aligned: bool = False) -> np.ndarray:
+    """Inverse of scaled_intrinsic()."""
+    K = K_img.copy()
+    if aligned:
+        K[0, 2] -= 0.5 * (k - 1)
+        K[1, 2] -= 0.5 * (k - 1)
+    return np.diag([1.0 / k, 1.0 / k, 1.0]) @ K
 
 
 def projection_matrix(K: np.ndarray, extrinsic: np.ndarray) -> np.ndarray:
@@ -596,8 +619,12 @@ def cross_view_consensus(geoms: Sequence[FrameGeometry], args: argparse.Namespac
     ]
     before = 100.0 * float(np.mean([v.mean() for v in valids]))
 
+    bilinear = getattr(args, "consensus_sampling", "nearest") == "bilinear"
+    fuse = getattr(args, "consensus_fuse", "median")
+
     for pass_index in range(args.consensus_passes):
         updated = []
+        surfaces: dict[int, np.ndarray] = {}  # each view's own surface, backprojected once per pass
         for rc in range(len(geoms)):
             depth_rc, valid_rc = depths[rc], valids[rc]
             if not valid_rc.any():
@@ -617,14 +644,34 @@ def cross_view_consensus(geoms: Sequence[FrameGeometry], args: argparse.Namespac
                 inside = valid_rc & (z > 0) & (u >= 0) & (u < width - 1) & (v >= 0) & (v < height - 1)
                 candidate = np.full_like(depth_rc, np.nan)
                 if inside.any():
+                    if tc not in surfaces:
+                        surfaces[tc] = _backproject(depth_tc, cams[tc], rays[tc])
                     yi, xi = np.nonzero(inside)
-                    ui = np.round(u[inside]).astype(np.int32)
-                    vi = np.round(v[inside]).astype(np.int32)
+                    uf, vf = u[inside], v[inside]
+                    ui = np.round(uf).astype(np.int32)
+                    vi = np.round(vf).astype(np.int32)
                     hit = valid_tc[vi, ui]
                     if hit.any():
-                        yi, xi, ui, vi = yi[hit], xi[hit], ui[hit], vi[hit]
+                        yi, xi, ui, vi, uf, vf = yi[hit], xi[hit], ui[hit], vi[hit], uf[hit], vf[hit]
                         # tc's own surface point, re-expressed as a depth along rc's ray
-                        surface = _backproject(depth_tc, cams[tc])[vi, ui]
+                        surface = surfaces[tc][vi, ui]
+                        if bilinear:
+                            # nearest-pixel lookup quantises the neighbour's surface to its
+                            # pixel grid: on a sloped cheek that is up to +-0.5 px of
+                            # position error turned into a depth error that aliases into a
+                            # regular ripple.  Interpolate where all four corners are valid
+                            # and belong to the same surface.
+                            x0 = np.floor(uf).astype(np.int32)
+                            y0 = np.floor(vf).astype(np.int32)
+                            ax = (uf - x0)[:, None]
+                            ay = (vf - y0)[:, None]
+                            corners = [(y0, x0), (y0, x0 + 1), (y0 + 1, x0), (y0 + 1, x0 + 1)]
+                            ok4 = np.logical_and.reduce([valid_tc[cy, cx] for cy, cx in corners])
+                            dz = np.stack([depth_tc[cy, cx] for cy, cx in corners], 0)
+                            ok4 &= (dz.max(0) - dz.min(0)) < args.consensus_tolerance * pix_rc[yi, xi]
+                            s00, s01, s10, s11 = (surfaces[tc][cy, cx] for cy, cx in corners)
+                            interp = (1 - ay) * ((1 - ax) * s00 + ax * s01) + ay * ((1 - ax) * s10 + ax * s11)
+                            surface = np.where(ok4[:, None], interp, surface)
                         along_ray = np.einsum("ij,ij->i", surface - cams[rc]["C"], world_rays[yi, xi])
                         keep = np.abs(along_ray - depth_rc[yi, xi]) < args.consensus_tolerance * pix_rc[yi, xi]
                         candidate[yi[keep], xi[keep]] = along_ray[keep]
@@ -633,7 +680,18 @@ def cross_view_consensus(geoms: Sequence[FrameGeometry], args: argparse.Namespac
 
             with warnings.catch_warnings():  # all-NaN columns are expected (invalid pixels)
                 warnings.simplefilter("ignore", RuntimeWarning)
-                fused = np.nanmedian(np.stack(stack, 0), axis=0)
+                stacked = np.stack(stack, 0)
+                fused = np.nanmedian(stacked, axis=0)
+                if fuse == "inlier-mean":
+                    # The median picks ONE view's value per pixel (or the mean of two), and
+                    # which view that is changes from pixel to pixel -> a patchwork of
+                    # 0.5-pixSize steps.  Averaging every corroborating value close to the
+                    # median is smoother and, for Gaussian noise, ~1.5x more efficient.
+                    band = args.consensus_fuse_band * pix_rc
+                    inl = np.abs(stacked - fused[None]) <= band[None]
+                    fused = np.where(
+                        inl.any(0), np.nansum(np.where(inl, stacked, 0.0), 0) / np.maximum(inl.sum(0), 1), fused
+                    )
             new_valid = valid_rc & (agreeing >= args.consensus_min_agree) & np.isfinite(fused)
             fused = np.where(new_valid, fused, INVALID_DEPTH)
             updated.append((fused, new_valid))
@@ -716,8 +774,9 @@ def build_dense_seed_landmarks(
         rays /= np.linalg.norm(rays, axis=0, keepdims=True)
         points = (vr["center"][:, None] + rays * depths[None, :]).T  # (N, 3)
 
+        off = 0.5 * (k - 1) if args.pixel_center == "aligned" else 0.0
         obs_pixels: list[dict[int, tuple[float, float]]] = [
-            {rc: (float(x * k), float(y * k))} for x, y in zip(xs, ys)
+            {rc: (float(x * k + off), float(y * k + off))} for x, y in zip(xs, ys)
         ]
 
         for other in geoms:
@@ -745,7 +804,7 @@ def build_dense_seed_landmarks(
             actual = vt["ray_depth"][iv[idx], iu[idx]]
             agree = np.abs(expected - actual) < tol * expected
             for i in idx[agree]:
-                obs_pixels[i][tc] = (float(u[i] * k), float(v[i] * k))
+                obs_pixels[i][tc] = (float(u[i] * k + off), float(v[i] * k + off))
 
         landmarks.extend({"X": point, "observations": obs} for point, obs in zip(points, obs_pixels))
 
@@ -863,7 +922,8 @@ def refine_poses_with_ba(
     # so the initial reconstruction is self-consistent, then divide back out below.
     extrinsics = np.stack([g.extrinsic.astype(np.float64) for g in geoms])
     extrinsics[:, :3, 3] *= args.scene_scale
-    intrinsics = np.stack([scaled_intrinsic(g.intrinsic, k) for g in geoms])
+    aligned = args.pixel_center == "aligned"
+    intrinsics = np.stack([scaled_intrinsic(g.intrinsic, k, aligned) for g in geoms])
 
     reconstruction, valid_idx = _landmarks_to_pycolmap(
         lms, view_ids, extrinsics, intrinsics, image_size, args.ba_min_inliers_per_frame
@@ -883,7 +943,7 @@ def refine_poses_with_ba(
         geom.extrinsic = np.asarray(pyimage.cam_from_world().matrix(), dtype=np.float64)
         geom.extrinsic[:3, 3] /= args.scene_scale
         K = np.asarray(reconstruction.cameras[pyimage.camera_id].calibration_matrix(), dtype=np.float64)
-        geom.intrinsic = K / float(k)
+        geom.intrinsic = unscaled_intrinsic(K, k, aligned)
 
     for point3d_id, vidx in enumerate(valid_idx, start=1):
         if point3d_id in reconstruction.points3D:  # BA's outlier filtering may drop a point
@@ -1060,6 +1120,7 @@ def build_sfmdata(
     image_paths: dict[int, Path],
     version: str,
     landmarks: Sequence[dict[str, Any]] | None = None,
+    pixel_center_aligned: bool = False,
 ) -> dict[str, Any]:
     """AliceVision SfMData, boost::property_tree JSON flavour.
 
@@ -1079,7 +1140,7 @@ def build_sfmdata(
     for geom in geoms:
         frame_w, frame_h = geom.frame_size
         img_w, img_h = frame_w * k, frame_h * k
-        K = scaled_intrinsic(geom.intrinsic, k)
+        K = scaled_intrinsic(geom.intrinsic, k, pixel_center_aligned)
         fx, fy = float(K[0, 0]), float(K[1, 1])
         cx, cy = float(K[0, 2]), float(K[1, 2])
 
@@ -1199,7 +1260,7 @@ def save_sfmdata(sfm: dict[str, Any], path: Path) -> None:
 
 
 def upsample_to_image_grid(
-    ray_depth: np.ndarray, sim: np.ndarray, valid: np.ndarray, k: int, rtol: float
+    ray_depth: np.ndarray, sim: np.ndarray, valid: np.ndarray, k: int, rtol: float, method: str = "linear"
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Resample a network-resolution depth map onto the camera's own pixel grid.
 
@@ -1223,6 +1284,13 @@ def upsample_to_image_grid(
     interpolated value as real surface and web the nose edge to the cheek behind it.  Any
     output pixel whose source neighbourhood straddles a jump larger than `rtol` (or touches
     an invalid pixel) is therefore dropped rather than interpolated.
+
+    method="cubic" uses bicubic instead of bilinear inside continuous regions.  Bilinear
+    is only C0: the upsampled surface is a grid of flat-ish bilinear patches whose normals
+    jump at every network pixel (0.46 mm on the face), and nine views laid on top of each
+    other at different orientations print that grid into the mesh as a fine orange-peel
+    relief.  Bicubic is C1 across cells.  Its 4x4 support is one pixel wider, so the guard
+    band around jumps / invalid pixels is widened to match.
     """
     if k <= 1:
         return ray_depth, sim, valid
@@ -1238,6 +1306,9 @@ def upsample_to_image_grid(
     hi = cv2.dilate(d, kernel)
     jump = (hi - lo) > rtol * np.maximum(d, 1e-9)
     guard = cv2.dilate(((~valid) | jump).astype(np.uint8), kernel) > 0
+    if method == "cubic":
+        guard = cv2.dilate(guard.astype(np.uint8), kernel) > 0
+    smooth = cv2.INTER_CUBIC if method == "cubic" else cv2.INTER_LINEAR
 
     # Guarded pixels are resampled nearest-neighbour rather than dropped: nearest never
     # interpolates, so it cannot invent surface between the nose edge and the cheek behind
@@ -1247,7 +1318,7 @@ def upsample_to_image_grid(
     depth_up = np.where(
         guard_up,
         cv2.resize(d, size, interpolation=cv2.INTER_NEAREST),
-        cv2.resize(d, size, interpolation=cv2.INTER_LINEAR),
+        cv2.resize(d, size, interpolation=smooth),
     )
     sim_f = sim.astype(np.float32)
     sim_up = np.where(
@@ -1255,6 +1326,7 @@ def upsample_to_image_grid(
         cv2.resize(sim_f, size, interpolation=cv2.INTER_NEAREST),
         cv2.resize(sim_f, size, interpolation=cv2.INTER_LINEAR),
     )
+    sim_up = np.clip(sim_up, -1.0, 0.0)
     depth_up[~valid_up] = INVALID_DEPTH
     sim_up[~valid_up] = 0.0
     return depth_up.astype(np.float32), sim_up.astype(np.float32), valid_up
@@ -1282,10 +1354,11 @@ def export_frames(
         ray_depth[~valid] = INVALID_DEPTH
         sim = confidence_to_similarity(geom.conf, valid)
 
-        K_img = scaled_intrinsic(geom.intrinsic, k)  # scale-1 == image resolution
+        # scale-1 == image resolution
+        K_img = scaled_intrinsic(geom.intrinsic, k, args.pixel_center == "aligned")
         if args.depth_resolution == "image":
             ray_depth, sim, valid = upsample_to_image_grid(
-                ray_depth, sim, valid, k, args.depth_edge_rtol or 0.03
+                ray_depth, sim, valid, k, args.depth_edge_rtol or 0.03, args.depth_upsample
             )
             depth_downscale = 1
             K_depth = K_img
@@ -1541,6 +1614,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                           "'network' writes them at inference resolution and tells AliceVision "
                           "the downscale, which costs k^2 samples AND inflates pixSize by k, "
                           "fusing away detail the data supports (see upsample_to_image_grid)")
+    net.add_argument("--depth-upsample", default="linear", choices=["linear", "cubic"],
+                     help="interpolation used by --depth-resolution image inside continuous regions. "
+                          "'cubic' is C1 and removes the network-pixel facet grid that bilinear "
+                          "prints into the mesh (v4)")
+    net.add_argument("--pixel-center", default="legacy", choices=["legacy", "aligned"],
+                     help="how network-resolution intrinsics are scaled by k. 'legacy' (v1-v3) "
+                          "uses k*K and puts every view's rays (k-1)/2 image pixels off; "
+                          "'aligned' adds the (k-1)/2 principal-point shift that centre-aligned "
+                          "resizing implies (v4). See scaled_intrinsic()")
 
     filt = parser.add_argument_group("depth filtering")
     filt.add_argument("--conf-percentile", type=float, default=0.0,
@@ -1584,6 +1666,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                       help="edge-aware box smoothing applied after the consensus passes (0 = off)")
     cons.add_argument("--consensus-smooth-tolerance", type=float, default=3.0,
                       help="only average neighbours within this many pixSize, so real edges survive")
+    cons.add_argument("--consensus-sampling", default="nearest", choices=["nearest", "bilinear"],
+                      help="how a neighbour view's depth is looked up at the reprojected position. "
+                           "'nearest' (v3) quantises it to the neighbour's pixel grid, which on "
+                           "sloped skin becomes a regular depth ripple; 'bilinear' (v4) interpolates")
+    cons.add_argument("--consensus-fuse", default="median", choices=["median", "inlier-mean"],
+                      help="how corroborating depths are combined. 'median' (v3) switches source "
+                           "view from pixel to pixel; 'inlier-mean' (v4) averages all values within "
+                           "--consensus-fuse-band of the median")
+    cons.add_argument("--consensus-fuse-band", type=float, default=2.0,
+                      help="inlier band around the median for --consensus-fuse inlier-mean, in pixSize")
 
     tex = parser.add_argument_group("texture images")
     tex.add_argument("--image-scale", type=int, default=0,
@@ -1700,6 +1792,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                       help="meshDenoising signal-weight sigma; smaller = stricter about what counts "
                            "as a feature to preserve")
 
+    rtx = parser.add_argument_group("registered Laplacian-pyramid re-texturing (texture_pyramid.py)")
+    rtx.add_argument("--retexture", default="none", choices=["none", "pyramid"],
+                     help="after aliceVision_texturing, re-bake the atlas with per-band weights, "
+                          "optical-flow registration of every view, per-surface-point gains and "
+                          "specular down-weighting -> texturedMesh_pyramid/ (v4: pyramid)")
+    import texture_pyramid
+
+    texture_pyramid.add_options(rtx, prefix="pyr-")
+
     txt = parser.add_argument_group("aliceVision_texturing")
     txt.add_argument("--texture-side", type=int, default=8192, choices=[1024, 2048, 4096, 8192, 16384])
     txt.add_argument("--texture-downscale", type=int, default=1, choices=[1, 2, 4, 8])
@@ -1792,7 +1893,10 @@ def process_capture(
                 with Section("pycolmap bundle adjustment (pose refinement)"):
                     refine_poses_with_ba(geoms, k, landmarks, args)
             written = export_frames(geoms, k, out, args, exr)
-            save_sfmdata(build_sfmdata(geoms, k, written, args.sfm_version, landmarks), sfm_path)
+            save_sfmdata(
+                build_sfmdata(geoms, k, written, args.sfm_version, landmarks, args.pixel_center == "aligned"),
+                sfm_path,
+            )
     else:
         if not sfm_path.is_file():
             raise SystemExit(f"--skip-inference given but {sfm_path} does not exist")
@@ -1938,6 +2042,16 @@ def process_capture(
             # equalised exposure, so this would only force a pointless linear round-trip
             correctEV=False,
         )
+
+    if args.retexture == "pyramid" and not args.dry_run:
+        import av_mesh_io
+        import texture_pyramid
+
+        with Section("registered Laplacian-pyramid re-texturing"):
+            cams = av_mesh_io.load_sfm_cameras(sfm_path, image_dir)
+            opts = texture_pyramid.options_from_args(args, prefix="pyr-")
+            texture_pyramid.retexture(texture_dir / "texturedMesh.obj", cams, out / "texturedMesh_pyramid", opts)
+        log(f"re-textured   : {out / 'texturedMesh_pyramid' / 'texturedMesh.obj'}")
 
     log("")
     log(f"textured mesh : {texture_dir / 'texturedMesh.obj'}")

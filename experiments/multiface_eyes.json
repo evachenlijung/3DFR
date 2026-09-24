@@ -1,0 +1,15 @@
+{
+ "note": "Multiface 6795937 E001 frame 000102: 3D points on the two irises, picked in camera 400016 at pixels (300,608) and (812,608); millimetres, dataset world frame",
+ "eye_centres_mm": [
+  [
+   -26.827467538258638,
+   -47.13243016466764,
+   990.4062860613897
+  ],
+  [
+   39.93806322552686,
+   -46.09141157820793,
+   1003.4180095399939
+  ]
+ ]
+}

@@ -7,6 +7,8 @@ texturing 產出帶貼圖的 `.obj`。
 > **最後更新 2026-09-24。** §1–§5 是管線本身的說明；**§7 是實驗紀錄**——試過什麼、
 > 結果如何、下一步測什麼，以及哪些舊結論已經被推翻。先看 §7 再看前面，
 > 因為 §2.5 和 §5.5 有幾段已作廢的建議（就地標註了）。
+> **§8 是 v4**：貼圖改用 Laplacian／Gaussian 金字塔重新烘焙、幾何修正像素中心偏移，
+> 在公開資料集 Multiface 上以與拍攝設備相同的 7+2 相機配置驗證。
 
 ```
 images/ ──[VGGT-Omega]──► poses + dense depth
@@ -368,6 +370,14 @@ simMap 值域 `[-1, 0]`，−1 最好（AliceVision 的融合權重是
 | `--output` | `<images>_alicevision` | 輸出資料夾；預設建立在 `--images` 同層目錄，見上方「1.2 執行」 |
 | `--skip-inference` | — | 重用輸出資料夾裡既有的 sfm/深度圖，只重跑 AliceVision |
 | `--dense-mvs` | — | 改用 AliceVision 原生 PatchMatch 深度估計，網格密度接近原生 Meshroom；見「5.5 密集重建」 |
+| `--pixel-center` | `legacy` | **v4：`aligned`**。k 倍內參加上 (k−1)/2 主點偏移；見 §8.3 |
+| `--consensus-sampling` | `nearest` | **v4：`bilinear`**。consensus 查鄰近視角深度時雙線性內插 |
+| `--consensus-fuse` | `median` | **v4：`inlier-mean`**。平均中位數 ±`--consensus-fuse-band`（2 pixSize）內的佐證值 |
+| `--depth-upsample` | `linear` | **v4：`cubic`**。深度圖上採樣到影像網格時用雙三次 |
+| `--retexture` | `none` | **v4：`pyramid`**。AliceVision 貼圖後用 `texture_pyramid.py` 重新烘焙 → `texturedMesh_pyramid/` |
+| `--pyr-band-sharpness` | `8 6 4 2 1 1` | 每個頻段的權重銳度（最細在前）；大 = 最佳視角主導，1 = 平均 |
+| `--pyr-specular-min-band` | 2 | 高光降權從第幾個頻段開始；0 = 全部頻段（最忠實、較軟） |
+| `--pyr-no-align` / `--pyr-no-gain` / `--pyr-no-specular` | — | 關掉光流對齊／逐點增益／高光降權 |
 
 調參時 `--skip-inference` 很有用：推論跑一次，之後反覆調 texturing 參數。
 
@@ -784,3 +794,169 @@ band 1 少視角  ->  眼睛銳利 + 中頻視角差異留下接縫
 * Windows 端的 Python 讀不到 `/mnt/c/` → Python 用 `C:/...`，WSL 用 `/mnt/c/...`。
 * Windows 終端 `cp950` 編碼會在 `‰` 之類的字元炸掉 → 設 `PYTHONIOENCODING=utf-8`。
 * WSL 的 OpenCV 預設停用 EXR → 讀深度圖前先 `export OPENCV_IO_ENABLE_OPENEXR=1`。
+
+---
+
+## 8. v4：金字塔重新貼圖 + 幾何一致性修正（2026-09-24）
+
+三個目標：(1) 用 Gaussian / Laplacian 金字塔保留皮膚高頻細節，特別是眼周；
+(2) 貼圖無接縫；(3) 模型表面的凹凸再降低。
+
+### 8.1 怎麼驗證的（公開資料集，不含任何病患資料）
+
+私人資料不能放進公開 repo，所以改在 **Multiface**（Meta，CC BY-NC 4.0，受試者
+6795937，表情 E001，第 102 格）上測，相機配置照拍攝設備挑：
+
+| 角色 | Multiface 相機 | 方位角 / 仰角 |
+|---|---|---|
+| 7 台與眼睛同高 | 400053, 400042, 400012, 400016, 400013, 400028, 400059 | −71°…+76°，仰角 ±9° 內 |
+| 2 台下巴下方往上拍 | 400031, 400061 | 仰角約 +45° |
+| 保留評分（不參與貼圖） | 400030, 400048, 400060, 400004, 400039, 400017, 400018, 400029, 400069, 400051 | 正面與側面 |
+
+**真實的部分**：照片（1334×2048）、相機校正、皮膚／眼睛／打光、相機間色差、
+AliceVision 2023.3 的 meshing / meshFiltering / meshDenoising / texturing 二進位檔（CPU 版）、
+本腳本自己的匯出程式碼（consensus、上採樣、EXR/SfM 寫出）與 v3 參數。
+k=3，跟實際 1024 解析度的執行一樣。
+
+**模擬的部分**：VGGT-Omega 的深度圖。從 Multiface 追蹤網格（細分 + 平滑後當參考曲面）
+在網路解析度（416×640）渲染，再加上每個視角各自的低頻偏移（標準差 0.6 mm）和像素雜訊
+（0.15 mm），模擬 VGGT 各視角彼此不一致的情況。
+
+重現方式（資料集只下載一格影格；38 台相機的 PNG 從 3.1 GB 的 tar 串流中擷取，約 1.5 分鐘）：
+
+```bash
+B=https://fb-baas-f32eacb9-8abb-11eb-b2b8-4857dd089e15.s3.amazonaws.com/MugsyDataRelease/v0.0/identities/6795937
+curl -sS $B/metadata.tar | tar -x
+curl -sS $B/tracked_mesh--E001_Neutral_Eyes_Open.tar | tar -x
+curl -sS $B/images--E001_Neutral_Eyes_Open.tar | tar -x --wildcards '*/000102.png'
+python experiments/multiface_eval.py   --multiface m--20180227--0000--6795937--GHS --av-root $ALICEVISION_ROOT --work /tmp/mf_eval
+python experiments/geometry_ablation.py --multiface m--20180227--0000--6795937--GHS --av-root $ALICEVISION_ROOT --work /tmp/mf_geom
+```
+
+**限制**：只有一位受試者、一格影格、一組模擬的深度誤差；數字代表方向，不是定論。
+真正的驗收要在 `C:/atop/data/test_set.txt` 那 5 組上跑（§8.5）。
+
+### 8.2 貼圖：`texture_pyramid.py`（Laplacian 金字塔 + 光流對齊）
+
+**為什麼調 `aliceVision_texturing` 解不開**（接續 §7.5–§7.7）：AliceVision 以**三角形**為單位、
+以**整數視角數**分配頻段，band 1 最少也要平均 2 個視角，最高頻段在三角形邊界硬切換；
+而且視角是照網格投影的位置直接疊加，網格差 0.5–1 mm 時兩張照片會錯開 1–3 px。
+
+**新做法**：AliceVision 貼圖後，保留它的 UV 展開，重新烘焙每個 texel：
+
+1. **每個頻段用連續的權重銳度 p_b**（Burt & Adelson 1983）：權重在各視角自己的影像空間計算
+   （入射角、解析度、離遮擋邊界／影像邊界的距離），取 p_b 次方後用 Gaussian 金字塔平滑到
+   該頻段的尺度。p=8 ≈「幾乎只用最佳視角」，p=1 = 加權平均。預設 `8 6 4 2 1 1`（最細頻段在前）。
+   權重在每個頻段的過渡寬度等於該頻段的波長，所以**任何頻段都沒有三角形邊界的接縫**。
+2. **每張照片先對齊再混合**：把參考貼圖（以最佳視角為主的混合）渲染回該視角，用 DIS 光流
+   找出網格預測的內容在照片裡實際在哪裡，texel 在修正後的位置取樣（Eisemann et al. 2008,
+   *Floating Textures*）。實測各視角錯位中位數 0.3–1.0 px，p95 為 2–6 px，與 §7.6 的推算一致。
+3. **逐表面點的增益**：用多個視角看到的**同一個表面點**，對多視角中位數做穩健比值，
+   這才是 `--harmonize` 原本想做的事（§7.7 量到它對構圖敏感、實際無效）。
+4. **鏡面高光降權**：某視角在同一點比多視角中位數亮很多時降低權重；只作用在第 2 頻段以上
+   （高光本來就在低頻，§7.7），最細的兩個頻段留給幾何上最好的視角。
+
+每個頻段是精確分解（Σ_b L_b = I），只有一個視角看得到的 texel 會被原樣重現。
+
+**結果**（10 個保留視角平均；眼周 = 兩眼中心 14 mm 內；`_reg` = 先用光流消除網格造成的錯位再評分，
+量到的是模糊／鬼影／接縫，而不是幾何誤差；細節能量比 1 = 跟照片一樣銳利）：
+
+| 方法 | PSNR | PSNR_reg | 眼周 PSNR_reg | 眼周 SSIM_reg | 眼周細節能量比 | 眼周細節相關 |
+|---|---|---|---|---|---|---|
+| AliceVision v3（`1 1 10 0`） | 30.72 | 31.51 | 26.32 | 0.701 | 0.644 | 0.117 |
+| 只取最佳視角 | 30.82 | 31.91 | 26.75 | 0.723 | 0.697 | 0.122 |
+| 全部視角加權平均 | 31.40 | 32.32 | 27.26 | 0.729 | 0.523 | 0.120 |
+| **金字塔 `8 6 4 2 1 1`（預設）** | 31.14 | 32.28 | **27.34** | **0.741** | **0.686** | **0.137** |
+| 金字塔 `32 16 4 2 1 1`（更銳利） | 31.07 | 32.24 | 27.20 | 0.735 | **0.758** | 0.135 |
+
+* 金字塔版本在眼周**每一個指標都贏 AliceVision v3**，而且兩端都顧到：比「加權平均」銳利
+  （0.686 vs 0.523），又比「只取最佳視角」忠實（相關 0.137 vs 0.122）。
+* 肉眼差異最大的是**接縫**：AliceVision v3 在鼻樑、內眼角有明顯的亮色色塊，金字塔版本沒有
+  （3D 檢視器「貼圖」比較）。
+* `--pyr-specular-min-band 0`（高光降權套用到所有頻段）更忠實但較軟：同一網格上眼周
+  PSNR_reg 27.62、細節相關 0.161，細節能量比降到 0.548。
+* 光流對齊的貢獻小但一致為正（同設定下眼周細節相關 0.152 → 0.161、中頻相關 0.522 → 0.535）。
+  它的效果受限於殘留的幾何誤差，幾何越準、對齊越能讓中頻多平均幾個視角。
+
+### 8.3 幾何：四個深度匯出修正（`--pixel-center` / `--consensus-*` / `--depth-upsample`）
+
+1. **`--pixel-center aligned`（最重要）**。舊版把網路解析度的內參直接乘 k，但管線裡每一次縮放
+   （PIL 縮照片、cv2 放大深度圖）都是中心對齊的：網路像素 i 的中心在影像像素 k·i + (k−1)/2，
+   不是 k·i。k=3 時**每個視角的光線（深度與顏色一起）偏了 1 個影像像素**（臉上約 0.13 mm），
+   而且每個視角偏的方向是它自己的影像軸，所以視角之間互相對不上。
+2. **`--consensus-sampling bilinear`**：consensus 查鄰近視角深度時不再取最近像素，
+   避免在斜面上產生規則的量化波紋。
+3. **`--consensus-fuse inlier-mean`**：不再用中位數（它每個像素挑不同視角，造成 0.5 pixSize 的
+   補丁狀階梯），改為平均中位數 ±2 pixSize 內的所有佐證值。
+4. **`--depth-upsample cubic`**：雙三次插值是 C1 連續，不會把網路像素的格狀折面印進網格。
+
+**結果**（臉部區域與參考曲面比較；法線誤差就是打光時看到的凹凸）：
+
+| 設定 | 距離中位數 mm | 距離 p90 mm | 法線誤差中位數 | 法線誤差 p90 | 原始網格二面角 >10° |
+|---|---|---|---|---|---|
+| v3 | 0.098 | 0.270 | 1.93° | 6.04° | 22.5% |
+| v3 + cubic | 0.097 | 0.269 | 1.92° | 5.99° | 24.3% |
+| v3 + bilinear | 0.102 | 0.285 | 2.01° | 6.18° | 20.3% |
+| v3 + inlier-mean | 0.100 | 0.256 | 1.86° | 5.88° | 23.9% |
+| v3 + **aligned** | 0.088 | 0.249 | 1.90° | 5.85° | **10.6%** |
+| **v4-depth（四項合併）** | **0.081** | **0.235** | **1.81°** | **5.67°** | **10.2%** |
+
+（除了最後一欄，都是 meshDenoising 之後的網格。原始網格的法線誤差 v3 3.13° → v4 2.19°。）
+
+單獨看只有 `aligned` 效果明顯，但四項合併比任何一項都好。
+
+### 8.4 試過但**沒有**採用的（凹凸）
+
+| 在 v4-depth 之上再加 | 距離中位數 | 距離 p90 | 法線誤差中位數 | 結論 |
+|---|---|---|---|---|
+| Taubin 平滑 ×20（`experiments/mesh_smooth.py`） | 0.080 | 0.232 | 1.83° | 無效，p90 二面角反而上升 |
+| `--consensus-smooth-radius 4` | 0.080 | 0.232 | 1.86° | 變差，原始網格更粗糙 |
+| `--denoise-iterations 5` | 0.095 | 0.273 | 2.19° | **看起來更平，但偏離真實曲面** |
+| Meshroom 範本 denoise（λ2, η1.8, ν0.3）×5 | 0.121 | 0.383 | 2.70° | 看起來最平（二面角 >10° 只剩 0.1%），**誤差最大** |
+
+這解釋了 §7.3(c)：Meshroom 那種「乾淨平滑」的觀感是把曲面壓成一片片平面換來的，
+對術前模擬是錯的方向。denoise 之後剩下的起伏是**中頻**（幾 mm 到十幾 mm），來自各視角深度
+彼此不一致，所以必須在網格化**之前**處理（§8.3），網格後處理只能把它抹平成錯的形狀。
+
+### 8.5 v4 建議指令
+
+```bash
+python vggt_omega_to_alicevision.py \
+  --images $D/photos --masks $D/masks_david --output $D/photos_alicevision_v4 \
+  --checkpoint checkpoints/vggt_omega_1b_512.pt --av-bin $ALICEVISION_ROOT/bin \
+  --image-resolution 1024 --device cuda \
+  --pixel-center aligned --consensus-sampling bilinear --consensus-fuse inlier-mean \
+  --depth-upsample cubic \
+  --retexture pyramid
+# 輸出：$D/photos_alicevision_v4/texturedMesh_pyramid/texturedMesh.obj
+#（AliceVision 原本的 texturedMesh/ 也會保留，方便對照）
+```
+
+已有 v3 輸出、只想換貼圖時（不重跑推論與 meshing）：
+
+```bash
+python texture_pyramid.py --input $D/photos_alicevision_v3 --debug
+# 想要更銳利的皮膚紋理：--band-sharpness 32 16 4 2 1 1
+# 想要最忠實於照片：   --specular-min-band 0
+```
+
+所有新選項預設都是關閉的（v3 行為），舊結果可以原樣重現。
+
+**記憶體**：`texture_pyramid.py` 在 8192 圖集（約 4,000 萬 texel）時估計需要 5–6 GB RAM（未實測，4096 圖集實測可在 15 GB 的機器上跑）；
+先用 `--texture-side 4096` 試跑。9 個視角、4096 圖集在 4 核 CPU 上約 2 分鐘。
+
+### 8.6 其他發現
+
+* **AliceVision 輸出的網格座標是 (x, −y, −z)**，也就是相對於 SfMData 相機（OpenCV 慣例）
+  做了 `diag(1,−1,−1)`。`av_mesh_io.align_mesh_to_cameras()` 會自動偵測並轉回來；
+  任何拿 AliceVision 網格去跟相機一起算的程式都要注意這點。
+* 同一組深度圖重跑 meshing，法線誤差會有約 ±0.01° 的波動（graph-cut 的隨機性），
+  小於這個量級的差異不要當真。
+
+### 8.7 下一步
+
+1. 在 `test_set.txt` 的 5 組真實 capture 上跑 §8.5 的 v4 指令，和 v3 並排看（3D 檢視器的
+   `experiments/export_viewer_assets.py` 可以直接打包任何 OBJ）。
+2. 幾何誤差變小之後，光流對齊能讓中頻平均更多視角：再掃一次 `--band-sharpness` 的中段（第 2–3 頻段）。
+3. §7.9 的第 2 點（`--image-resolution 1152`）與 §7.9 的第 3 點（交叉偏振片）仍然成立，
+   而且跟本節的改動互不衝突。
