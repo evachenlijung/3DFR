@@ -348,7 +348,7 @@ simMap 值域 `[-1, 0]`，−1 最好（AliceVision 的融合權重是
 
 ## 5. 常用參數
 
-> 預設值在 2026-09-24 改過一輪，理由與量測見 §7.3。舊預設寫在括號裡。
+> 預設值在 2026-09-24 改過一輪（理由見 §7.3），2026-09-25 再把 v4 設為預設（§8）。舊預設寫在括號裡。
 
 | 參數 | 預設 | 說明 |
 |---|---|---|
@@ -370,14 +370,15 @@ simMap 值域 `[-1, 0]`，−1 最好（AliceVision 的融合權重是
 | `--output` | `<images>_alicevision` | 輸出資料夾；預設建立在 `--images` 同層目錄，見上方「1.2 執行」 |
 | `--skip-inference` | — | 重用輸出資料夾裡既有的 sfm/深度圖，只重跑 AliceVision |
 | `--dense-mvs` | — | 改用 AliceVision 原生 PatchMatch 深度估計，網格密度接近原生 Meshroom；見「5.5 密集重建」 |
-| `--pixel-center` | `legacy` | **v4：`aligned`**。k 倍內參加上 (k−1)/2 主點偏移；見 §8.3 |
-| `--consensus-sampling` | `nearest` | **v4：`bilinear`**。consensus 查鄰近視角深度時雙線性內插 |
-| `--consensus-fuse` | `median` | **v4：`inlier-mean`**。平均中位數 ±`--consensus-fuse-band`（2 pixSize）內的佐證值 |
-| `--depth-upsample` | `linear` | **v4：`cubic`**。深度圖上採樣到影像網格時用雙三次 |
-| `--retexture` | `none` | **v4：`pyramid`**。AliceVision 貼圖後用 `texture_pyramid.py` 重新烘焙 → `texturedMesh_pyramid/` |
+| `--pixel-center` | **`aligned`**（v3：`legacy`） | k 倍內參加上 (k−1)/2 主點偏移；見 §8.3 |
+| `--consensus-sampling` | **`bilinear`**（v3：`nearest`） | consensus 查鄰近視角深度時雙線性內插 |
+| `--consensus-fuse` | **`inlier-mean`**（v3：`median`） | 平均中位數 ±`--consensus-fuse-band`（2 pixSize）內的佐證值 |
+| `--depth-upsample` | **`cubic`**（v3：`linear`） | 深度圖上採樣到影像網格時用雙三次 |
+| `--retexture` | **`pyramid`**（v3：`none`） | AliceVision 貼圖後用 `texture_pyramid.py` 重新烘焙 → `texturedMesh_pyramid/` |
 | `--pyr-band-sharpness` | `8 6 4 2 1 1` | 每個頻段的權重銳度（最細在前）；大 = 最佳視角主導，1 = 平均 |
 | `--pyr-specular-min-band` | 2 | 高光降權從第幾個頻段開始；0 = 全部頻段（最忠實、較軟） |
 | `--pyr-no-align` / `--pyr-no-gain` / `--pyr-no-specular` | — | 關掉光流對齊／逐點增益／高光降權 |
+| `--legacy-v3` | — | 把上面五個旗標一次改回 v3 的值，用來重現舊結果 |
 
 調參時 `--skip-inference` 很有用：推論跑一次，之後反覆調 texturing 參數。
 
@@ -920,17 +921,19 @@ python experiments/geometry_ablation.py --multiface m--20180227--0000--6795937--
 
 ### 8.5 v4 建議指令
 
+**v4 已是預設值**（2026-09-25 起）：`--pixel-center aligned --consensus-sampling bilinear
+--consensus-fuse inlier-mean --depth-upsample cubic --retexture pyramid` 不用再手動加。
+
 ```bash
 python vggt_omega_to_alicevision.py \
   --images $D/photos --masks $D/masks_david --output $D/photos_alicevision_v4 \
   --checkpoint checkpoints/vggt_omega_1b_512.pt --av-bin $ALICEVISION_ROOT/bin \
-  --image-resolution 1024 --device cuda \
-  --pixel-center aligned --consensus-sampling bilinear --consensus-fuse inlier-mean \
-  --depth-upsample cubic \
-  --retexture pyramid
-# 輸出：$D/photos_alicevision_v4/texturedMesh_pyramid/texturedMesh.obj
-#（AliceVision 原本的 texturedMesh/ 也會保留，方便對照）
+  --image-resolution 1024 --device cuda
+# 輸出：$D/photos_alicevision_v4/texturedMesh_pyramid/texturedMesh.obj   ← v4 成品
+#       $D/photos_alicevision_v4/texturedMesh/texturedMesh.obj           ← AliceVision 原貼圖，對照用
 ```
+
+要重現 v3：加 `--legacy-v3`（一次把上面五個旗標改回 v3 的值）。
 
 已有 v3 輸出、只想換貼圖時（不重跑推論與 meshing）：
 
@@ -940,7 +943,7 @@ python texture_pyramid.py --input $D/photos_alicevision_v3 --debug
 # 想要最忠實於照片：   --specular-min-band 0
 ```
 
-所有新選項預設都是關閉的（v3 行為），舊結果可以原樣重現。
+v3 的結果用 `--legacy-v3` 可以原樣重現。
 
 **記憶體**：`texture_pyramid.py` 在 8192 圖集（約 4,000 萬 texel）時估計需要 5–6 GB RAM（未實測，4096 圖集實測可在 15 GB 的機器上跑）；
 先用 `--texture-side 4096` 試跑。9 個視角、4096 圖集在 4 核 CPU 上約 2 分鐘。

@@ -1614,15 +1614,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                           "'network' writes them at inference resolution and tells AliceVision "
                           "the downscale, which costs k^2 samples AND inflates pixSize by k, "
                           "fusing away detail the data supports (see upsample_to_image_grid)")
-    net.add_argument("--depth-upsample", default="linear", choices=["linear", "cubic"],
+    net.add_argument("--depth-upsample", default="cubic", choices=["linear", "cubic"],
                      help="interpolation used by --depth-resolution image inside continuous regions. "
-                          "'cubic' is C1 and removes the network-pixel facet grid that bilinear "
-                          "prints into the mesh (v4)")
-    net.add_argument("--pixel-center", default="legacy", choices=["legacy", "aligned"],
+                          "'cubic' (v4) is C1 and removes the network-pixel facet grid that bilinear "
+                          "(v3) prints into the mesh")
+    net.add_argument("--pixel-center", default="aligned", choices=["legacy", "aligned"],
                      help="how network-resolution intrinsics are scaled by k. 'legacy' (v1-v3) "
                           "uses k*K and puts every view's rays (k-1)/2 image pixels off; "
-                          "'aligned' adds the (k-1)/2 principal-point shift that centre-aligned "
-                          "resizing implies (v4). See scaled_intrinsic()")
+                          "'aligned' (v4) adds the (k-1)/2 principal-point shift that centre-aligned "
+                          "resizing implies. See scaled_intrinsic()")
 
     filt = parser.add_argument_group("depth filtering")
     filt.add_argument("--conf-percentile", type=float, default=0.0,
@@ -1666,11 +1666,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                       help="edge-aware box smoothing applied after the consensus passes (0 = off)")
     cons.add_argument("--consensus-smooth-tolerance", type=float, default=3.0,
                       help="only average neighbours within this many pixSize, so real edges survive")
-    cons.add_argument("--consensus-sampling", default="nearest", choices=["nearest", "bilinear"],
+    cons.add_argument("--consensus-sampling", default="bilinear", choices=["nearest", "bilinear"],
                       help="how a neighbour view's depth is looked up at the reprojected position. "
                            "'nearest' (v3) quantises it to the neighbour's pixel grid, which on "
                            "sloped skin becomes a regular depth ripple; 'bilinear' (v4) interpolates")
-    cons.add_argument("--consensus-fuse", default="median", choices=["median", "inlier-mean"],
+    cons.add_argument("--consensus-fuse", default="inlier-mean", choices=["median", "inlier-mean"],
                       help="how corroborating depths are combined. 'median' (v3) switches source "
                            "view from pixel to pixel; 'inlier-mean' (v4) averages all values within "
                            "--consensus-fuse-band of the median")
@@ -1793,10 +1793,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                            "as a feature to preserve")
 
     rtx = parser.add_argument_group("registered Laplacian-pyramid re-texturing (texture_pyramid.py)")
-    rtx.add_argument("--retexture", default="none", choices=["none", "pyramid"],
+    rtx.add_argument("--retexture", default="pyramid", choices=["none", "pyramid"],
                      help="after aliceVision_texturing, re-bake the atlas with per-band weights, "
                           "optical-flow registration of every view, per-surface-point gains and "
-                          "specular down-weighting -> texturedMesh_pyramid/ (v4: pyramid)")
+                          "specular down-weighting -> texturedMesh_pyramid/ (v4). AliceVision's own "
+                          "texturedMesh/ is always kept next to it")
     import texture_pyramid
 
     texture_pyramid.add_options(rtx, prefix="pyr-")
@@ -1832,10 +1833,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     flow.add_argument("--export-only", action="store_true", help="stop after writing the AliceVision inputs")
     flow.add_argument("--dry-run", action="store_true", help="print AliceVision commands without running them")
     flow.add_argument("--continue-on-error", action="store_true", help="batch mode: keep going after a failure")
+    flow.add_argument("--legacy-v3", action="store_true",
+                      help="reproduce v3: --pixel-center legacy --consensus-sampling nearest "
+                           "--consensus-fuse median --depth-upsample linear --retexture none "
+                           "(overrides those five flags)")
     flow.add_argument("--verbose-level", default="info",
                       choices=["fatal", "error", "warning", "info", "debug", "trace"])
 
     args = parser.parse_args(argv)
+    if args.legacy_v3:
+        args.pixel_center, args.consensus_sampling, args.consensus_fuse = "legacy", "nearest", "median"
+        args.depth_upsample, args.retexture = "linear", "none"
     if not args.images and not args.batch_root:
         parser.error("one of --images or --batch-root is required")
     if args.ba and not args.dense_mvs:

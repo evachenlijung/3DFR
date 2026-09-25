@@ -329,7 +329,11 @@ def main() -> int:
     pipeline_argv = ["--images", str(work / "photos"), "--checkpoint", "unused.pt",
                      "--av-bin", str(args.av_root / "bin"), "--output", str(pipe),
                      "--image-resolution", str(args.image_resolution),
-                     "--texture-side", str(args.texture_side), "--skip-inference"] + args.pipeline_args.split()
+                     "--texture-side", str(args.texture_side), "--skip-inference",
+                     # the texture comparison is run on the v3 geometry; later flags override
+                     "--depth-upsample", "linear", "--pixel-center", "legacy",
+                     "--consensus-sampling", "nearest", "--consensus-fuse", "median",
+                     "--retexture", "none"] + args.pipeline_args.split()
     pargs = v2a.parse_args(pipeline_argv)
     pargs.device = "cpu"
     if not args.skip_pipeline:

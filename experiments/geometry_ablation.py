@@ -36,14 +36,17 @@ import av_mesh_io as io  # noqa: E402
 import mesh_smooth  # noqa: E402
 import multiface_eval as me  # noqa: E402
 
+# explicit on both sides, so the configs do not depend on which version is the default
+V3 = ["--depth-upsample", "linear", "--pixel-center", "legacy",
+      "--consensus-sampling", "nearest", "--consensus-fuse", "median"]
 V4 = ["--depth-upsample", "cubic", "--pixel-center", "aligned",
       "--consensus-sampling", "bilinear", "--consensus-fuse", "inlier-mean"]
 CONFIGS = {
-    "v3": [],
-    "v3+cubic": ["--depth-upsample", "cubic"],
-    "v3+aligned": ["--pixel-center", "aligned"],
-    "v3+bilinear": ["--consensus-sampling", "bilinear"],
-    "v3+inlier-mean": ["--consensus-fuse", "inlier-mean"],
+    "v3": V3,
+    "v3+cubic": V3 + ["--depth-upsample", "cubic"],
+    "v3+aligned": V3 + ["--pixel-center", "aligned"],
+    "v3+bilinear": V3 + ["--consensus-sampling", "bilinear"],
+    "v3+inlier-mean": V3 + ["--consensus-fuse", "inlier-mean"],
     "v4-depth": V4,
     # second round: v4-depth plus stronger consensus smoothing / mesh denoising
     "v4+smooth4": V4 + ["--consensus-smooth-radius", "4"],
