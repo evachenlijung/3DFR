@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>網格並排比較</title>
+<style>
+:root{
+  --bg:#eef1ef; --panel:#ffffff; --ink:#18201d; --muted:#5b6862; --line:#d3dad6;
+  --accent:#2e6b5e; --accent-ink:#ffffff; --stage:#1b2220; --stage-ink:#dfe7e3; --warn:#9a5b12;
+  --sans:"IBM Plex Sans","Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Consolas,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#121715; --panel:#1a211e; --ink:#e3ebe7; --muted:#9aa8a1; --line:#2d3833;
+         --accent:#6fb3a2; --accent-ink:#0f1513; --stage:#0c100f; --warn:#e0a458; color-scheme:dark; }
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:14px/1.45 var(--sans);display:flex;flex-direction:column}
+header.bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 18px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+h1{font-size:17px;margin:0;font-weight:600;letter-spacing:.01em}
+.lib{color:var(--muted);font-size:12px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:50ch}
+.tools{display:flex;flex-wrap:wrap;gap:8px 16px;padding:8px 16px;border-bottom:1px solid var(--line);background:var(--panel);align-items:center}
+.grp{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.grp > .lbl{font-size:11px;font-weight:600;letter-spacing:.06em;color:var(--muted);text-transform:uppercase;margin-right:2px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.seg button{border:0;border-right:1px solid var(--line);border-radius:0}
+.seg button:last-child{border-right:0}
+button{font:500 13px/1 var(--sans);border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 11px;border-radius:7px;cursor:pointer;white-space:nowrap}
+button:hover{border-color:var(--accent)}
+button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink)}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+kbd{font:11px var(--mono);opacity:.65;margin-left:5px}
+input[type=range]{width:110px;accent-color:var(--accent)}
+.val{font:12px var(--mono);min-width:3.5ch;color:var(--muted)}
+main{position:relative;flex:1;min-height:320px;background:var(--stage)}
+main canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none}
+.pane{position:absolute;display:flex;flex-direction:column;pointer-events:none}
+.pane .head{pointer-events:auto;display:flex;flex-direction:column;gap:5px;padding:10px;max-width:min(560px,100%)}
+.pane .row{display:flex;gap:6px}
+.pane input[type=search],.pane select{font:13px var(--sans);background:rgba(12,16,15,.82);color:var(--stage-ink);border:1px solid rgba(223,231,227,.25);border-radius:6px;padding:6px 8px;min-width:0}
+.pane input[type=search]{width:9em;flex:none}
+.pane select{flex:1}
+.pane .info{font:12px/1.4 var(--mono);color:var(--stage-ink);background:rgba(12,16,15,.6);padding:4px 7px;border-radius:5px;align-self:flex-start;max-width:100%;overflow-wrap:anywhere}
+.pane .info.warn{color:#f0c27a}
+.pane .tagside{font:600 11px var(--sans);letter-spacing:.08em;color:var(--stage-ink);opacity:.7}
+.pane.drop::after{content:"放開以載入 OBJ（連同 .mtl 與貼圖一起拖進來）";position:absolute;inset:8px;border:2px dashed var(--accent);border-radius:10px;display:grid;place-items:center;color:var(--stage-ink);background:rgba(46,107,94,.18);font-size:15px}
+.divider{position:absolute;background:rgba(223,231,227,.2);pointer-events:none}
+.help{position:absolute;right:12px;bottom:10px;font:12px var(--sans);color:var(--stage-ink);opacity:.6;text-align:right;pointer-events:none}
+@media (max-width:700px){ .lib{display:none} }
+@media (prefers-reduced-motion: reduce){ *{transition:none!important} }
+</style>
+</head>
+<body>
+<header class="bar">
+  <h1>網格並排比較</h1>
+  <span class="lib" id="lib">讀取模型清單中…</span>
+  <button id="refresh" title="重新掃描資料夾">重新掃描</button>
+</header>
+
+<div class="tools">
+  <div class="grp" role="group" aria-label="著色">
+    <span class="lbl">著色</span>
+    <span class="seg" id="shading">
+      <button data-mode="unlit" aria-pressed="true" title="只顯示貼圖原本的顏色，不打光">純貼圖顏色<kbd>1</kbd></button>
+      <button data-mode="lit" aria-pressed="false" title="貼圖加上光照">貼圖＋光照<kbd>2</kbd></button>
+      <button data-mode="clay" aria-pressed="false" title="不用貼圖，灰色材質加光照，看表面凹凸">無貼圖＋光照<kbd>3</kbd></button>
+      <button data-mode="normal" aria-pressed="false" title="以顏色表示表面朝向，最容易看出細小起伏">法線色<kbd>4</kbd></button>
+    </span>
+    <button id="wire" aria-pressed="false">線框<kbd>W</kbd></button>
+    <button id="flat" aria-pressed="false" title="每個三角形一個法線，凸顯折面">平面著色<kbd>F</kbd></button>
+  </div>
+  <div class="grp" role="group" aria-label="光源">
+    <span class="lbl">光源</span>
+    <span class="seg" id="lightspace">
+      <button data-space="camera" aria-pressed="true" title="光源跟著鏡頭轉">跟著鏡頭</button>
+      <button data-space="world" aria-pressed="false" title="光源固定在模型座標，轉動時可看到光影變化">固定在模型</button>
+    </span>
+    <label>方位 <input id="az" type="range" min="-180" max="180" value="-40"></label><span class="val" id="az-v"></span>
+    <label>仰角 <input id="el" type="range" min="-60" max="85" value="25"></label><span class="val" id="el-v"></span>
+    <label>強度 <input id="int" type="range" min="0" max="400" value="220"></label>
+    <label>環境光 <input id="amb" type="range" min="0" max="150" value="35"></label>
+  </div>
+  <div class="grp" role="group" aria-label="版面">
+    <span class="lbl">版面</span>
+    <span class="seg" id="layout">
+      <button data-layout="h" aria-pressed="true">左右</button>
+      <button data-layout="v" aria-pressed="false">上下</button>
+    </span>
+    <span class="seg" id="align">
+      <button data-align="shared" aria-pressed="true" title="兩個模型共用同一個座標原點（同一次拍攝的不同版本用這個）">共用座標</button>
+      <button data-align="own" aria-pressed="false" title="各自移到畫面中心（不同拍攝互相比較時用）">各自置中</button>
+    </span>
+    <button id="swap">交換<kbd>S</kbd></button>
+    <button id="flipx" title="繞 X 軸轉 180°（模型上下顛倒時）">上下翻轉</button>
+    <button id="reset">重設視角<kbd>R</kbd></button>
+    <button id="shot">截圖</button>
+  </div>
+</div>
+
+<main id="stage">
+  <canvas id="c"></canvas>
+  <div class="divider" id="divider"></div>
+  <section class="pane" id="pane0" aria-label="左側模型">
+    <div class="head">
+      <span class="tagside" id="side0">左</span>
+      <div class="row"><input type="search" id="q0" placeholder="篩選…" aria-label="篩選左側清單"><select id="s0" aria-label="左側模型"></select></div>
+      <span class="info" id="i0">選一個模型，或把 OBJ 拖進來</span>
+    </div>
+  </section>
+  <section class="pane" id="pane1" aria-label="右側模型">
+    <div class="head">
+      <span class="tagside" id="side1">右</span>
+      <div class="row"><input type="search" id="q1" placeholder="篩選…" aria-label="篩選右側清單"><select id="s1" aria-label="右側模型"></select></div>
+      <span class="info" id="i1">選一個模型，或把 OBJ 拖進來</span>
+    </div>
+  </section>
+  <div class="help">拖曳旋轉 · 滾輪縮放 · 右鍵拖曳平移 · 兩邊同步</div>
+</main>
+
+<script type="importmap">
+{"imports":{"three":"./vendor/three/three.module.min.js","three/addons/":"./vendor/three/addons/"}}
+</script>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
